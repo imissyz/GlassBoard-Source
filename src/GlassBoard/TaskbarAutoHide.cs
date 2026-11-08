@@ -1,7 +1,7 @@
 using System;
-using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 
 namespace GlassBoard;
 
@@ -35,7 +35,17 @@ public static class TaskbarAutoHide
 
 	private static string Journal => Path.Combine(Store.Folder, "taskbar-autohide.json");
 
-	public static bool Enabled => (State() & 1) != 0;
+	private static readonly TaskbarStateAccess Access = new TaskbarStateAccess(ReadNative, WriteNative);
+
+	public static bool Enabled => (ReadState() & 1) != 0;
+
+	public static async Task<bool> ReadEnabledAsync() => ((await Access.ReadAsync().ConfigureAwait(false)) & 1u) != 0;
+
+	public static async Task<bool> SetAsync(bool? enabled) => ((await Access.SetAutoHideAsync(enabled).ConfigureAwait(false)) & 1u) != 0;
+
+	internal static uint ReadState() => Access.ReadAsync().GetAwaiter().GetResult();
+
+	internal static void WriteState(uint state) => Access.WriteAsync(state).GetAwaiter().GetResult();
 
 	[DllImport("shell32.dll")]
 	private static extern UIntPtr SHAppBarMessage(uint message, ref APPBARDATA data);
@@ -57,66 +67,37 @@ public static class TaskbarAutoHide
 		return result;
 	}
 
-	private static uint State()
+	private static uint ReadNative()
 	{
 		APPBARDATA data = Data();
-		// SHAppBarMessage 与 explorer 通信：explorer 崩溃/挂起时该调用会阻塞。
-		// 后台线程 + 400ms 超时兜底，返回 0 视为"无自动隐藏"，不让 UI 线程陪冻。
-		try
-		{
-			System.Threading.Tasks.Task<uint> task = System.Threading.Tasks.Task.Run(() => (uint)SHAppBarMessage(4u, ref data).ToUInt64());
-			return task.Wait(400) ? task.Result : 0u;
-		}
-		catch
-		{
-			return 0u;
-		}
+		return (uint)SHAppBarMessage(4u, ref data).ToUInt64();
 	}
 
-	private static void Apply(uint state)
+	private static void WriteNative(uint state)
 	{
 		APPBARDATA data = Data();
 		data.Param = new IntPtr(state);
-		// 异步投递：调用方不依赖结果；explorer 挂起时后台任务自然排队，不冻结 UI。
-		try
-		{
-			System.Threading.Tasks.Task.Run(() => SHAppBarMessage(10u, ref data));
-		}
-		catch
-		{
-		}
+		SHAppBarMessage(10u, ref data);
 	}
 
 	public static void Set(bool enabled)
 	{
-		uint num = State();
-		if ((num & 1) != 0 != enabled)
-		{
-			Directory.CreateDirectory(Store.Folder);
-			if (!File.Exists(Journal))
-			{
-				File.WriteAllText(Journal, num.ToString(CultureInfo.InvariantCulture));
-			}
-			Apply(FeatureRules.AutoHideState(num, enabled));
-		}
+		SetAsync(enabled).GetAwaiter().GetResult();
 	}
 
-	public static void Restore()
+	public static void RetireLegacyJournal()
 	{
+		// Automatic hiding is a Windows setting. App startup/exit must not undo
+		// a subsequent change made in Windows Settings using an old session journal.
 		if (File.Exists(Journal))
 		{
-			uint num = uint.Parse(File.ReadAllText(Journal), CultureInfo.InvariantCulture);
-			Apply(FeatureRules.AutoHideState(State(), (num & 1) != 0));
-			File.Delete(Journal);
+			File.Move(Journal, Journal + ".legacy-" + DateTime.UtcNow.Ticks);
 		}
 	}
 
 	public static void ShowAndClear()
 	{
-		Apply(FeatureRules.AutoHideState(State(), enabled: false));
-		if (File.Exists(Journal))
-		{
-			File.Delete(Journal);
-		}
+		Set(false);
+		RetireLegacyJournal();
 	}
 }

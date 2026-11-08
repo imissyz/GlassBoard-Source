@@ -53,6 +53,10 @@ public class Controller
 	private bool settingsOpen;
 
 	private Window settingsWindow;
+	private readonly SemaphoreSlim taskbarChanges = new SemaphoreSlim(1, 1);
+	private DispatcherTimer taskbarStateTimer;
+	private bool syncingTaskbarState;
+	private bool? actualTaskbarAutoHide;
 
 	private System.Windows.Controls.TabControl settingsTabs;
 
@@ -243,6 +247,9 @@ public class Controller
 		Store.Trace("START phase=watcher ms=" + (Environment.TickCount - Program.ProcessStartTick));
 		EnsureSystemEntries();
 		ApplyShellPreferences();
+		taskbarStateTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(2) };
+		taskbarStateTimer.Tick += async (s, e) => await SyncTaskbarPreferenceAsync();
+		taskbarStateTimer.Start();
 		try
 		{
 			// 开机恢复用户设置的壁纸（文件已被移动/删除时保持现状，不打扰）。
@@ -446,30 +453,19 @@ public class Controller
 		return HotkeyRules.Label(Prefs.Hotkeys.First((HotkeySetting k) => k.ActionId == id));
 	}
 
-	// 开机启动后自动应用用户保存的桌面开关状态（隐藏任务栏 / 隐藏桌面图标 / 任务栏自动隐藏）
+	// 自动隐藏以 Windows 实际状态为准；不能在启动时把旧偏好强制写回系统。
 	private void ApplyShellPreferences()
 	{
 		try
 		{
 			if (Prefs.HideTaskbar)
 			{
-				try
-				{
-					if (TaskbarAutoHide.Enabled)
-					{
-						TaskbarAutoHide.Set(enabled: false);
-					}
-				}
-				catch (Exception ex)
-				{
-					Store.Log(ex);
-				}
 				DesktopVisibility.SetHidden(taskbar: true, hide: true);
+				actualTaskbarAutoHide = false;
 			}
-			else if (Prefs.AutoHideTaskbar)
+			else
 			{
-				DesktopVisibility.SetHidden(taskbar: true, hide: false);
-				TaskbarAutoHide.Set(enabled: true);
+				_ = SyncTaskbarPreferenceAsync();
 			}
 			if (Prefs.HideDesktopIcons)
 			{
@@ -479,6 +475,44 @@ public class Controller
 		catch (Exception ex)
 		{
 			Store.Log(ex);
+		}
+	}
+
+	private async Task SyncTaskbarPreferenceAsync()
+	{
+		if (ShuttingDown || syncingTaskbarState || taskbarChanges.CurrentCount == 0)
+		{
+			return;
+		}
+		if (Prefs.HideTaskbar)
+		{
+			actualTaskbarAutoHide = false;
+			return;
+		}
+		syncingTaskbarState = true;
+		try
+		{
+			bool actual = await TaskbarAutoHide.ReadEnabledAsync();
+			if (ShuttingDown || Prefs.HideTaskbar || taskbarChanges.CurrentCount == 0)
+			{
+				return;
+			}
+			actualTaskbarAutoHide = actual;
+			if (Prefs.AutoHideTaskbar != actual)
+			{
+				Prefs.AutoHideTaskbar = actual;
+				Save();
+				Store.Trace("SHELL adopt Windows taskbar auto-hide=" + actual);
+			}
+		}
+		catch
+		{
+			// Unknown is not off: keep the saved preference and display an unknown state.
+			actualTaskbarAutoHide = null;
+		}
+		finally
+		{
+			syncingTaskbarState = false;
 		}
 	}
 
@@ -3027,9 +3061,8 @@ public class Controller
 					ToggleButton toggleButton = VisibilitySwitch();
 					if (id == 7)
 					{
-						// 以用户偏好为准（与「隐藏任务栏」互斥），不读运行时 ABS_AUTOHIDE 位：
-						// 隐藏任务栏内部也走 ABS_AUTOHIDE，读位会让两个开关同时显示开启。
-						toggleButton.IsChecked = Prefs.AutoHideTaskbar && !Prefs.HideTaskbar;
+						toggleButton.IsChecked = !Prefs.HideTaskbar && actualTaskbarAutoHide == true;
+						toggleButton.IsEnabled = actualTaskbarAutoHide.HasValue;
 					}
 					else
 					{
@@ -3141,10 +3174,14 @@ public class Controller
 					{
 						try
 						{
-							// 与「隐藏任务栏」互斥的偏好状态，而非运行时 ABS_AUTOHIDE 位
-							bool enabled2 = Prefs.AutoHideTaskbar && !Prefs.HideTaskbar;
+							bool enabled2 = !Prefs.HideTaskbar && actualTaskbarAutoHide == true;
 							switches[7].IsChecked = enabled2;
-							text2 = text2 + " · 自动隐藏：" + (enabled2 ? "开启" : "关闭");
+							switches[7].IsEnabled = taskbarChanges.CurrentCount != 0 && actualTaskbarAutoHide.HasValue;
+							if (switches.TryGetValue(2, out ToggleButton hideSwitch))
+							{
+								hideSwitch.IsEnabled = taskbarChanges.CurrentCount != 0;
+							}
+							text2 += " · 自动隐藏：" + (taskbarChanges.CurrentCount == 0 ? "切换中…" : (!actualTaskbarAutoHide.HasValue ? "暂时无法读取" : (enabled2 ? "开启" : "关闭")));
 						}
 						catch
 						{
@@ -3155,8 +3192,9 @@ public class Controller
 				}
 				syncing = false;
 			};
-			stateTimer.Tick += (object s, EventArgs e) =>
+			stateTimer.Tick += async (object s, EventArgs e) =>
 			{
+				await SyncTaskbarPreferenceAsync();
 				updateState();
 			};
 			updateState();
@@ -3663,23 +3701,30 @@ public class Controller
 		}
 	}
 
-	public void ShellAction(int action, bool? hidden = null)
+	public async void ShellAction(int action, bool? hidden = null)
 	{
+		await taskbarChanges.WaitAsync();
 		try
 		{
+			if (ShuttingDown)
+			{
+				return;
+			}
 			string text;
 			switch (action)
 			{
 			case 1:
 			{
 				bool flag = hidden ?? (!DesktopVisibility.DesiredHidden(taskbar: true));
-				if (flag && TaskbarAutoHide.Enabled)
-				{
-					TaskbarAutoHide.Set(enabled: false);
-				}
 				text = DesktopVisibility.SetHidden(taskbar: true, flag);
+				if (DesktopVisibility.DesiredHidden(taskbar: true) != flag)
+				{
+					throw new InvalidOperationException(text);
+				}
+				bool autoHide = !flag && await TaskbarAutoHide.ReadEnabledAsync();
 				Prefs.HideTaskbar = flag;
-				Prefs.AutoHideTaskbar = false;
+				Prefs.AutoHideTaskbar = autoHide;
+				actualTaskbarAutoHide = autoHide;
 				Save();
 				break;
 			}
@@ -3689,18 +3734,13 @@ public class Controller
 				Save();
 				break;
 			default:
-				try
-				{
-					TaskbarAutoHide.ShowAndClear();
-				}
-				catch (Exception ex)
-				{
-					Store.Log(ex);
-				}
 				DesktopVisibility.ShowAll();
+				await TaskbarAutoHide.SetAsync(false);
+				TaskbarAutoHide.RetireLegacyJournal();
 				Prefs.HideTaskbar = false;
 				Prefs.HideDesktopIcons = false;
 				Prefs.AutoHideTaskbar = false;
+				actualTaskbarAutoHide = false;
 				Save();
 				text = "已执行任务栏与桌面图标恢复";
 				break;
@@ -3713,8 +3753,14 @@ public class Controller
 		}
 		catch (Exception ex2)
 		{
+			actualTaskbarAutoHide = null;
 			Store.Log(ex2);
 			System.Windows.MessageBox.Show("无法切换系统界面：" + ex2.Message, "GlassBoard-Source");
+		}
+		finally
+		{
+			taskbarChanges.Release();
+			await SyncTaskbarPreferenceAsync();
 		}
 	}
 
@@ -3722,6 +3768,11 @@ public class Controller
 	{
 		if (ShuttingDown)
 		{
+			return;
+		}
+		if (taskbarChanges.CurrentCount == 0)
+		{
+			Board.SetStatus("任务栏设置正在切换，请完成后再退出");
 			return;
 		}
 		try
@@ -3743,6 +3794,7 @@ public class Controller
 			return;
 		}
 		ShuttingDown = true;
+		taskbarStateTimer?.Stop();
 		try
 		{
 			ControlCenter?.Close();
@@ -3760,7 +3812,7 @@ public class Controller
 		}
 		try
 		{
-			TaskbarAutoHide.Restore();
+			TaskbarAutoHide.RetireLegacyJournal();
 		}
 		catch (Exception ex3)
 		{
@@ -5135,17 +5187,8 @@ public class Controller
 	{
 		try
 		{
-			bool flag = enabled ?? (!TaskbarAutoHide.Enabled);
-			if (flag)
-			{
-				DesktopVisibility.SetHidden(taskbar: true, hide: false);
-			}
-			TaskbarAutoHide.Set(flag);
-			Prefs.AutoHideTaskbar = flag;
-			Prefs.HideTaskbar = false;
-			Save();
-			Board.SetStatus("已请求" + (flag ? "启用" : "关闭") + " Windows 任务栏自动隐藏");
-			await Task.Delay(250);
+			await ChangeTaskbarAutoHideAsync(enabled);
+			Board.SetStatus("已确认" + (Prefs.AutoHideTaskbar ? "启用" : "关闭") + " Windows 任务栏自动隐藏");
 			if (System.Windows.Application.Current != null && !System.Windows.Application.Current.Dispatcher.HasShutdownStarted)
 			{
 				Dock.Refresh();
@@ -5155,6 +5198,38 @@ public class Controller
 		{
 			Store.Log(ex);
 			System.Windows.MessageBox.Show(ex.Message, "Windows 任务栏自动隐藏");
+		}
+	}
+
+	internal async Task ChangeTaskbarAutoHideAsync(bool? enabled)
+	{
+		await taskbarChanges.WaitAsync();
+		try
+		{
+			if (ShuttingDown)
+			{
+				return;
+			}
+			bool? target = enabled ?? (Prefs.HideTaskbar ? (bool?)true : null);
+			// Finish temporary complete-hide restoration before changing automatic hiding.
+			if (Prefs.HideTaskbar || DesktopVisibility.DesiredHidden(taskbar: true))
+			{
+				DesktopVisibility.SetHidden(taskbar: true, hide: false);
+			}
+			bool actual = await TaskbarAutoHide.SetAsync(target);
+			Prefs.AutoHideTaskbar = actual;
+			Prefs.HideTaskbar = false;
+			actualTaskbarAutoHide = actual;
+			Save();
+		}
+		catch
+		{
+			actualTaskbarAutoHide = null;
+			throw;
+		}
+		finally
+		{
+			taskbarChanges.Release();
 		}
 	}
 

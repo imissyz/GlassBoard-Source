@@ -3392,6 +3392,14 @@ public class DockWindow : GlassWindow
 		});
 	}
 
+	public void CloseRunningList()
+	{
+		if (runningListPopup != null)
+		{
+			runningListPopup.IsOpen = false;
+		}
+	}
+
 	// 运行列表用 Popup 弹层：单击图标即弹出（与控制中心一样），再点或点击弹层外任意位置自动收起。
 	// 不用 ContextMenu：StaysOpen 菜单会吞掉下一次单击（点一下关、点两下才开）。
 	[System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -3417,6 +3425,7 @@ public class DockWindow : GlassWindow
 
 	private System.Windows.Controls.Primitives.Popup OpenRunningList(System.Windows.Controls.Button owner)
 	{
+		C.ControlCenter?.ClosePanel();
 		System.Windows.Controls.Primitives.Popup created = null;
 		Action close = delegate
 		{
@@ -3470,20 +3479,21 @@ public class DockWindow : GlassWindow
 					MaxWidth = 240.0,
 					TextTrimming = TextTrimming.CharacterEllipsis
 				};
+				// Reserve the icon slot before measuring; loading its source must not resize the popup.
+				System.Windows.Controls.Image appIcon = new System.Windows.Controls.Image
+				{
+					Width = 18.0,
+					Height = 18.0,
+					Stretch = Stretch.Uniform,
+					VerticalAlignment = VerticalAlignment.Center
+				};
+				content.Children.Add(appIcon);
 				content.Children.Add(nameBlock);
 				Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate
 				{
 					try
 					{
-						ImageSource iconSource = RunningWindows.Icon(selected.Windows[0]);
-						content.Children.Insert(0, new System.Windows.Controls.Image
-						{
-							Source = iconSource,
-							Width = 18.0,
-							Height = 18.0,
-							Stretch = Stretch.Uniform,
-							VerticalAlignment = VerticalAlignment.Center
-						});
+						appIcon.Source = RunningWindows.Icon(selected.Windows[0]);
 					}
 					catch
 					{
@@ -3581,35 +3591,24 @@ public class DockWindow : GlassWindow
 			BorderBrush = new System.Windows.Media.SolidColorBrush(line),
 			BorderThickness = new Thickness(1.0),
 			Child = scroller,
-			MinWidth = 220.0
+			MinWidth = 220.0,
+			MaxWidth = 460.0
 		};
 		System.Windows.Controls.Primitives.Popup popup = new System.Windows.Controls.Primitives.Popup
 		{
 			StaysOpen = false,
 			AllowsTransparency = true,
-			PopupAnimation = System.Windows.Controls.Primitives.PopupAnimation.Fade,
+			PopupAnimation = System.Windows.Controls.Primitives.PopupAnimation.None,
 			Placement = PlacementMode.Absolute,
 			Child = shell
 		};
 		// 不依赖 PlacementTarget：绝对坐标定位，避免 dock Refresh 重建按钮时弹层被连带关闭。
-		popup.Opened += delegate
-		{
-			Dispatcher.BeginInvoke(DispatcherPriority.Background, new Action(delegate
-			{
-				try
-				{
-					PositionRunningList(popup, shell, owner, shell.ActualWidth, shell.ActualHeight);
-				}
-				catch (Exception ex)
-				{
-					Store.Log(ex);
-				}
-			}));
-		};
 		created = popup;
 		// 打开前先手动测量得到预期尺寸并定位：Absolute 弹层若先开再定位，会先在屏幕
 		// 左上角 (0,0) 闪出，等定位回调才跳到位（"点运行程序左上角出现几秒"的根因）。
-		shell.Measure(new System.Windows.Size(460.0, 380.0));
+		shell.Measure(new System.Windows.Size(double.PositiveInfinity, double.PositiveInfinity));
+		shell.Width = shell.DesiredSize.Width;
+		shell.Height = shell.DesiredSize.Height;
 		PositionRunningList(popup, shell, owner, shell.DesiredSize.Width, shell.DesiredSize.Height);
 		popup.IsOpen = true;
 		return popup;

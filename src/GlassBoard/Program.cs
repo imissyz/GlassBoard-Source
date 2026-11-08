@@ -191,8 +191,8 @@ public static class Program
 				}
 				try
 				{
-					TaskbarAutoHide.Restore();
-					Store.Trace("START phase=taskbar-restore ms=" + (Environment.TickCount - ProcessStartTick));
+					TaskbarAutoHide.RetireLegacyJournal();
+					Store.Trace("START phase=taskbar-journal-retired ms=" + (Environment.TickCount - ProcessStartTick));
 				}
 				catch (Exception ex4)
 				{
@@ -219,7 +219,7 @@ public static class Program
 					}
 					try
 					{
-						TaskbarAutoHide.Restore();
+						TaskbarAutoHide.RetireLegacyJournal();
 					}
 					catch (Exception ex7)
 					{

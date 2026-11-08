@@ -102,6 +102,7 @@ public class ControlCenterWindow : GlassWindow
 	private Border brightnessSection;
 	private Slider brightnessSlider;
 	private TextBlock brightnessValue;
+	private TextBlock brightnessHint;
 	private Border btSection;
 	private StackPanel btListPanel;
 	private StackPanel homePage;
@@ -561,6 +562,8 @@ public class ControlCenterWindow : GlassWindow
 		// 亮度区块
 		brightnessSection = SectionCard();
 		Grid brightGrid = new Grid();
+		brightGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+		brightGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
 		brightGrid.ColumnDefinitions.Add(new ColumnDefinition
 		{
 			Width = GridLength.Auto
@@ -585,6 +588,7 @@ public class ControlCenterWindow : GlassWindow
 		{
 			Minimum = 0.0,
 			Maximum = 100.0,
+			IsEnabled = false,
 			VerticalAlignment = VerticalAlignment.Center
 		};
 		brightnessSlider.ValueChanged += (object s, RoutedPropertyChangedEventArgs<double> e) =>
@@ -607,12 +611,19 @@ public class ControlCenterWindow : GlassWindow
 		};
 		Grid.SetColumn(brightnessSlider, 1);
 		brightGrid.Children.Add(brightnessSlider);
-		brightnessValue = Label("100", 11.0, FontWeights.Normal, MutedBrush);
+		brightnessValue = Label("--", 11.0, FontWeights.Normal, MutedBrush);
 		brightnessValue.Width = 30.0;
 		brightnessValue.TextAlignment = TextAlignment.Right;
 		brightnessValue.VerticalAlignment = VerticalAlignment.Center;
 		Grid.SetColumn(brightnessValue, 2);
 		brightGrid.Children.Add(brightnessValue);
+		brightnessHint = Label("正在检测亮度…", 10.5, FontWeights.Normal, MutedBrush);
+		brightnessHint.Margin = new Thickness(0.0, 6.0, 0.0, 0.0);
+		brightnessHint.TextWrapping = TextWrapping.Wrap;
+		Grid.SetRow(brightnessHint, 1);
+		Grid.SetColumnSpan(brightnessHint, 3);
+		brightGrid.Children.Add(brightnessHint);
+		brightnessSection.Visibility = C.Prefs.ControlCenter.ShowBrightness ? Visibility.Visible : Visibility.Collapsed;
 		body.Children.Add(brightnessSection);
 
 		// 系统快捷行：电源 / 设置 / 锁屏（收纳 Dock 上的电源与设置入口）
@@ -853,7 +864,7 @@ public class ControlCenterWindow : GlassWindow
 		ShowPanel();
 	}
 
-	private void ClosePanel()
+	internal void ClosePanel()
 	{
 		if (closing || !IsVisible)
 		{
@@ -868,6 +879,7 @@ public class ControlCenterWindow : GlassWindow
 
 	private void ShowPanel()
 	{
+		C.Dock.CloseRunningList();
 		RefreshStyle();
 		ShowPage(0);
 		ApplyPageHeight();
@@ -1178,21 +1190,7 @@ public class ControlCenterWindow : GlassWindow
 		volumeSection.Visibility = ((options.ShowVolume && volumeSupported) ? Visibility.Visible : Visibility.Collapsed);
 		outputSection.Visibility = ((options.ShowOutput && volumeSupported) ? Visibility.Visible : Visibility.Collapsed);
 		audioSection.Visibility = ((volumeSection.Visibility == Visibility.Visible || outputSection.Visibility == Visibility.Visible) ? Visibility.Visible : Visibility.Collapsed);
-		if (brightness.HasValue)
-		{
-			brightnessSection.Visibility = (options.ShowBrightness ? Visibility.Visible : Visibility.Collapsed);
-			if (!brightnessDragging)
-			{
-				refreshing = true;
-				brightnessSlider.Value = brightness.Value;
-				brightnessValue.Text = brightness.Value.ToString();
-				refreshing = false;
-			}
-		}
-		else
-		{
-			brightnessSection.Visibility = Visibility.Collapsed;
-		}
+		ApplyBrightnessState(brightness, options.ShowBrightness);
 		if (volumeOk && !volumeDragging)
 		{
 			refreshing = true;
@@ -1748,12 +1746,46 @@ public class ControlCenterWindow : GlassWindow
 
 	// ==================== 亮度 ====================
 
+	private void ApplyBrightnessState(int? brightness, bool show)
+	{
+		brightnessSection.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+		brightnessSlider.IsEnabled = brightness.HasValue;
+		brightnessHint.Text = brightness.HasValue ? "亮度" : "当前显示器不支持亮度调节";
+		brightnessSection.ToolTip = brightness.HasValue ? null : brightnessHint.Text;
+		if (!brightness.HasValue)
+		{
+			brightnessDragging = false;
+			brightnessTimer?.Stop();
+			pendingBrightness = -1;
+			brightnessValue.Text = "--";
+			return;
+		}
+		if (!brightnessDragging)
+		{
+			bool wasRefreshing = refreshing;
+			refreshing = true;
+			try
+			{
+				brightnessSlider.Value = brightness.Value;
+				brightnessValue.Text = brightness.Value.ToString();
+			}
+			finally
+			{
+				refreshing = wasRefreshing;
+			}
+		}
+	}
+
 	private DispatcherTimer brightnessTimer;
 
 	private int pendingBrightness = -1;
 
 	private void ScheduleBrightnessSet()
 	{
+		if (!brightnessSlider.IsEnabled)
+		{
+			return;
+		}
 		pendingBrightness = (int)Math.Round(brightnessSlider.Value);
 		if (brightnessTimer == null)
 		{

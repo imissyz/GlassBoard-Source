@@ -32,21 +32,6 @@ public static class DesktopVisibility
 		public int Y;
 	}
 
-	private struct APPBARDATA
-	{
-		public uint Size;
-
-		public IntPtr Window;
-
-		public uint Message;
-
-		public uint Edge;
-
-		public RECT Rect;
-
-		public IntPtr Param;
-	}
-
 	private static readonly string RecoveryFile;
 
 	private static Dictionary<long, ShellState> original;
@@ -149,9 +134,6 @@ public static class DesktopVisibility
 	[DllImport("user32.dll", CharSet = CharSet.Unicode)]
 	private static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, string lParam, uint flags, uint timeout, out IntPtr result);
 
-	[DllImport("shell32.dll")]
-	private static extern UIntPtr SHAppBarMessage(uint message, ref APPBARDATA data);
-
 	private delegate void WinEventProc(IntPtr hook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint eventThread, uint eventTime);
 
 	[DllImport("user32.dll")]
@@ -214,72 +196,17 @@ public static class DesktopVisibility
 		return stringBuilder.ToString();
 	}
 
-	// —— AppBar 状态：ABS_AUTOHIDE(0x1) 让 Explorer 释放任务栏占用的屏幕工作区 ——
-	// 单纯 SW_HIDE 任务栏窗口并不会释放工作区：全屏/最大化应用仍按“任务栏高度”留空，
-	// 底部出现一条透明任务栏位置。给 AppBar 加上 ABS_AUTOHIDE 后 Explorer 才会广播全屏工作区。
-	private static APPBARDATA AppBarData()
-	{
-		return new APPBARDATA
-		{
-			Size = (uint)Marshal.SizeOf(typeof(APPBARDATA)),
-			Window = FindWindow("Shell_TrayWnd", null)
-		};
-	}
+	// Complete hiding and automatic hiding share a serialized, verified shell transport.
+	private static uint AppBarState() => TaskbarAutoHide.ReadState();
 
-	private static uint AppBarState()
-	{
-		APPBARDATA data = AppBarData();
-		// 任务栏窗口不存在（explorer 重启中、第三方外壳替换或系统级移除）时静默返回 0，
-		// 不能抛异常——Maintain 每 5 秒重试一次，抛异常会刷爆 error.log。
-		if (data.Window == IntPtr.Zero)
-		{
-			return 0u;
-		}
-		// SHAppBarMessage 会与 explorer 进程通信：explorer 崩溃或挂起时该调用会长时间
-		// 阻塞（等 shell 响应）。必须放到线程池并在 400ms 内拿不到结果就放弃，绝不
-		// 让 UI 线程陪着 explorer 一起冻住（Win10 上 explorer 崩溃会让整个程序看似退出）。
-		try
-		{
-			System.Threading.Tasks.Task<uint> task = System.Threading.Tasks.Task.Run(() => (uint)SHAppBarMessage(4u, ref data).ToUInt64());
-			return task.Wait(400) ? task.Result : 0u;
-		}
-		catch
-		{
-			return 0u;
-		}
-	}
-
-	private static void ApplyAppBarState(uint state)
-	{
-		APPBARDATA data = AppBarData();
-		if (data.Window == IntPtr.Zero)
-		{
-			return;
-		}
-		data.Param = new IntPtr(state);
-		// 异步投递：调用方都不依赖结果，explorer 挂起时后台任务自然排队，不影响 UI。
-		try
-		{
-			System.Threading.Tasks.Task.Run(() => SHAppBarMessage(10u, ref data));
-		}
-		catch
-		{
-		}
-	}
+	private static void ApplyAppBarState(uint state) => TaskbarAutoHide.WriteState(state);
 
 	// 还原隐藏前记录的 AppBar 状态（含 ABS_AUTOHIDE 位），恢复任务栏工作区占用
 	private static void RestoreAppBarState()
 	{
 		if (originalAppBarState.HasValue)
 		{
-			try
-			{
-				ApplyAppBarState(originalAppBarState.Value);
-			}
-			catch (Exception ex)
-			{
-				Store.Log(ex);
-			}
+			ApplyAppBarState(originalAppBarState.Value);
 			originalAppBarState = null;
 		}
 	}
@@ -463,6 +390,7 @@ public static class DesktopVisibility
 				catch (Exception ex)
 				{
 					Store.Log(ex);
+					throw;
 				}
 				// 两阶段：先让 AppBar 工作区变化被 Explorer/DWM 消化（桌面与动态壁纸层重新
 				// 布局），再把任务栏窗口藏起来。同一时刻连发两个桌面级变更时，Wallpaper
